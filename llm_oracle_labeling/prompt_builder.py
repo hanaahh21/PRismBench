@@ -1,111 +1,30 @@
 import json
-from typing import Dict
-from .config import MAX_PROMPT_CHARS
+from typing import Dict, List
 
-SYSTEM_INSTRUCTIONS = {
-    "task": (
-        "Analyze a pull request (PR) and determine its symptom-level risk types "
-        "based strictly on SZZ-linked origin issues and observable failure evidence."
+from .config import MAX_PROMPT_CHARS, UNARY_LABELS
+
+LABEL_DESCRIPTIONS = {
+    'Bug Risk': (
+        'Observable functional failures such as incorrect behavior, crashes, exceptions, '
+        'deadlocks, race conditions, broken features, or failing tests.'
     ),
-    "expected_output_schema": {
-        "risk_type_labels": (
-            "array of strings — use ONLY the predefined risk labels. "
-            "If non-risky, return exactly ['Non-risky']."
-        ),
-        "explanations": [
-            {
-                "label": "string — one of the selected risk type labels",
-                "confidence": (
-                    "number between 0.0 and 1.0 representing confidence based on evidence strength"
-                ),
-                "rationale": (
-                    "Concise explanation grounded explicitly in SZZ origin issues "
-                    "and observable failure symptoms"
-                )
-            }
-        ],
-        "IMPORTANT": (
-            "Return VALID JSON ONLY. "
-            "The 'confidence' field MUST be a numeric value, not a string."
-        )
-    },
-
-    "core_principle": (
-        "You must base ALL risk decisions on empirically observed failures reported "
-        "in SZZ origin issues. Do NOT speculate, predict, or infer hypothetical risks."
+    'Security Risk': (
+        'Observable security failures such as auth/authz bypass, data leakage, '
+        'privilege escalation, or policy violations.'
     ),
-
-    "context_definition": {
-        "pull_request": (
-            "A pull request (PR) represents a set of code changes that were merged "
-            "into the repository."
-        ),
-        "szz_origin_issues": (
-            "SZZ origin issues are issues or bug reports created AFTER the PR, "
-            "which were backtraced to this PR using the SZZ algorithm. "
-            "They represent observable failures introduced by the PR."
-        ),
-        "risk_definition": (
-            "Risk refers ONLY to real failures observed in production or testing "
-            "and reported in SZZ origin issues. Risk does NOT include potential, "
-            "theoretical, or hypothetical problems."
-        )
-    },
-
-    "risk_type_labels": {
-        "Bug Risk": (
-            "Observable functional or logical failures such as incorrect behavior, "
-            "wrong outputs, crashes, exceptions, test failures, deadlocks, race conditions or broken features."
-        ),
-        "Security Risk": (
-            "Observable failures related to vulnerabilities such as authentication flaws, "
-            "authorization bypasses, data leaks, privilege escalation, or policy violations."
-        ),
-        "Performance Risk": (
-            "Observable failures involving performance degradation, increased latency, "
-            "resource exhaustion, throughput reduction, or scalability regressions."
-        ),
-        "Maintainability Risk": (
-            "Failures caused by design or maintainability problems that later resulted "
-            "in regressions, fragile behavior, or difficulty fixing bugs."
-        ),
-        "Non-risky": (
-            "The PR has NO SZZ origin issues and NO observable failures attributed to it."
-        )
-    },
-
-    "mandatory_decision_process": [
-        "Step 1: Determine whether SZZ origin issues exist.",
-        "Step 2: If NO SZZ origin issues exist, return ONLY ['Non-risky'].",
-        "Step 3: If SZZ origin issues exist, you MUST assign at least one risk label.",
-        "Step 4: For each SZZ origin issue, identify the primary observable failure symptom.",
-        "Step 5: Map each observable failure to the MOST DIRECT risk type label."
-    ],
-
-    "label_selection_rules": [
-        "If SZZ origin issues exist, NEVER return 'Non-risky'.",
-        "Select Performance Risk ONLY if the issue explicitly reports latency, throughput, memory, CPU, or scalability degradation.",
-        "Multiple labels may be selected ONLY if the failures are independent and observable.",
-        "If one risk is a downstream consequence of another, select ONLY the primary symptom-level risk."
-    ],
-
-    "anti_hallucination_rules": [
-        "Do NOT invent failure types not mentioned in SZZ origin issues.",
-        "Do NOT infer intent or developer mistakes.",
-        "Do NOT use words like 'might', 'could', 'possibly', or 'likely'.",
-        "If evidence is weak or vague, explain the uncertainty but still assign the most appropriate label."
-    ],
-
-    "evidence_requirement": (
-        "Each selected risk label MUST be supported by explicit evidence "
-        "from SZZ origin issues. Reference concrete failure descriptions "
-        "such as crashes, incorrect output, exceptions, or regressions."
+    'Performance Risk': (
+        'Observable performance degradation such as increased latency, lower throughput, '
+        'resource exhaustion, memory/CPU regressions, or scalability issues.'
     ),
+    'Maintainability Risk': (
+        'Observed fragility or design debt that directly led to regressions or made bug '
+        'fixes difficult in follow-up issues.'
+    )
 }
 
 
-def build_prompt(pr: Dict) -> str:
-    szz_issues_raw = pr.get("szz_origin_issues", "[]")
+def _parse_szz_issues(pr: Dict) -> List[Dict]:
+    szz_issues_raw = pr.get('szz_origin_issues', '[]')
     if isinstance(szz_issues_raw, str):
         try:
             szz_issues = json.loads(szz_issues_raw)
@@ -116,40 +35,103 @@ def build_prompt(pr: Dict) -> str:
     else:
         szz_issues = []
 
-    ALLOWED_ISSUE_FIELDS = {
-        "issue_key",
-        "key",
-        "title",
-        "summary",
-        "description",
-        "priority",
-    }
-
-    cleaned_issues = []
+    allowed_issue_fields = {'issue_key', 'key', 'title', 'summary', 'description', 'priority'}
+    cleaned = []
     for issue in szz_issues:
         if isinstance(issue, dict):
-            cleaned_issues.append({
-                k: issue[k]
-                for k in ALLOWED_ISSUE_FIELDS
-                if k in issue
-            })
+            cleaned.append({k: issue[k] for k in allowed_issue_fields if k in issue})
+    return cleaned
 
-    pr_features = {
-        "pr_title": pr.get("pr_title", ""),
-        "pr_description": pr.get("pr_description", "")
+
+def _build_common_pr_payload(pr: Dict) -> Dict:
+    payload = {
+        'pr_number': pr.get('pr_number'),
+        'pr_title': pr.get('pr_title', ''),
+        'pr_description': pr.get('pr_description', ''),
+        'szz_origin_issues': _parse_szz_issues(pr)
     }
-
-    kajson_prompt = {
-        "szz_origin_issues": cleaned_issues,
-        "risky_pull_request_details": pr_features
-    }
-
-    prompt_str = json.dumps(kajson_prompt, indent=2)
-
+    prompt_str = json.dumps(payload)
     if len(prompt_str) > MAX_PROMPT_CHARS:
-        kajson_prompt["truncation_notice"] = (
-            "Prompt was truncated to fit the LLM context window."
-        )
-        prompt_str = json.dumps(kajson_prompt, indent=2)
+        payload['truncation_notice'] = 'PR content was truncated to fit the context window.'
+    return payload
 
+
+def _stringify_prompt(prompt_dict: Dict) -> str:
+    prompt_str = json.dumps(prompt_dict, indent=2)
+    if len(prompt_str) > MAX_PROMPT_CHARS:
+        prompt_dict['truncation_notice'] = 'Prompt was truncated to fit the LLM context window.'
+        prompt_str = json.dumps(prompt_dict, indent=2)
     return prompt_str
+
+
+def build_unary_layer0_prompt(pr: Dict, risk_label: str) -> str:
+    if risk_label not in UNARY_LABELS:
+        raise ValueError(f'Unsupported unary risk label: {risk_label}')
+
+    prompt = {
+        'task': 'Unary risk decision for one PR and one risk label',
+        'decision_label': risk_label,
+        'decision_label_definition': LABEL_DESCRIPTIONS[risk_label],
+        'instructions': [
+            'Decide ONLY for the selected decision_label.',
+            'Use only observable evidence from SZZ origin issues and PR details.',
+            'Do not speculate or infer hypothetical failures.',
+            "Return JSON only with keys: decision, reason.",
+            "decision must be exactly 'Yes' or 'No'."
+        ],
+        'output_schema': {
+            'decision': 'Yes|No',
+            'reason': 'Short evidence-grounded justification.'
+        },
+        'pr_context': _build_common_pr_payload(pr)
+    }
+    return _stringify_prompt(prompt)
+
+
+def build_unary_convergence_prompt(
+    pr: Dict,
+    risk_label: str,
+    current_model: str,
+    previous_decision: str,
+    previous_reason: str,
+    peer_feedback: List[Dict],
+    layer_number: int
+) -> str:
+    if risk_label not in UNARY_LABELS:
+        raise ValueError(f'Unsupported unary risk label: {risk_label}')
+
+    prompt = {
+        'task': 'Convergence unary risk reconsideration for one PR and one risk label',
+        'layer': layer_number,
+        'decision_label': risk_label,
+        'decision_label_definition': LABEL_DESCRIPTIONS[risk_label],
+        'instructions': [
+            f'You are {current_model}. Re-evaluate your previous decision for this same label.',
+            'Read your own prior decision and peer reasoning observations (NOT their conclusions).',
+            'Make your own independent decision. Keep if evidence supports it; change only if peer observations reveal new evidence.',
+            'Use only observable evidence from PR and SZZ origin issues.',
+            "Return JSON only with keys: decision, reason.",
+            "decision must be exactly 'Yes' or 'No'."
+        ],
+        'your_previous_decision': {
+            'decision': previous_decision,
+            'reasoning': previous_reason
+        },
+        'peer_observations_and_reasoning': peer_feedback,
+        'output_schema': {
+            'decision': 'Yes|No',
+            'reason': 'Short evidence-grounded justification.'
+        },
+        'pr_context': _build_common_pr_payload(pr)
+    }
+    return _stringify_prompt(prompt)
+
+
+# Backward-compatibility wrapper
+SYSTEM_INSTRUCTIONS = {
+    'task': 'Unary per-label PR risk labeling. Return JSON only.'
+}
+
+
+def build_prompt(pr: Dict) -> str:
+    return build_unary_layer0_prompt(pr, 'Bug Risk')

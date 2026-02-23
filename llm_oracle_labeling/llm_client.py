@@ -5,7 +5,6 @@ from .config import OLLAMA_URL, OLLAMA_TIMEOUT
 from .prompt_builder import SYSTEM_INSTRUCTIONS
 from .response_handler import parse_llm_json
 
-
 def query_ollama_model(model_name: str, user_prompt: str) -> dict:
     messages = [
         {

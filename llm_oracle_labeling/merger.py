@@ -1,103 +1,115 @@
 import json
 from typing import Dict, Tuple
+
 import pandas as pd
 from tqdm import tqdm
 
-from .config import CONSENSUS_THRESHOLD
-from .consensus import responses_agree
+from .config import LABEL_COLUMN_MAP
+
+
+DECISION_COLUMNS = list(LABEL_COLUMN_MAP.values())
+
+
+def _norm_decision(value) -> str:
+    text = str(value).strip().lower()
+    return 'Yes' if text in {'yes', 'y', 'true', '1'} else 'No'
+
+
+def _collect_model_row(df: pd.DataFrame, pr_number: int) -> pd.Series:
+    match = df[df['pr_number'] == pr_number]
+    if match.empty:
+        return pd.Series(dtype=object)
+    return match.iloc[0]
 
 
 def merge_model_results_and_apply_consensus(
     model_results: Dict[str, pd.DataFrame],
-    consensus_threshold: int = CONSENSUS_THRESHOLD
+    consensus_threshold: int = 3
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    print('\n' + '='*80)
-    print('📊 Merging results and applying consensus voting...')
-    print('='*80)
+    """
+    Strict consensus for unary pipeline:
+    PR is accepted only if all decision columns match across all participating models.
+    """
+    print('\n' + '=' * 80)
+    print('Merging unary model outputs and applying strict full-label consensus...')
+    print('=' * 80)
+
+    if not model_results:
+        return pd.DataFrame(), pd.DataFrame()
+
+    model_names = sorted(model_results.keys())
     all_pr_numbers = set()
     for df in model_results.values():
-        all_pr_numbers.update(df['pr_number'].unique())
+        all_pr_numbers.update(df['pr_number'].tolist())
 
     accepted_rows = []
-    human_rows = []
-    for pr_number in tqdm(sorted(all_pr_numbers), desc='Applying consensus'):
-        responses = []
-        for model_name, df in model_results.items():
-            pr_result = df[df['pr_number'] == pr_number]
-            if len(pr_result) == 0:
-                continue
-            pr_result = pr_result.iloc[0]
-            labels = pr_result['risk_type_labels']
-            if isinstance(labels, str):
-                try:
-                    labels = json.loads(labels)
-                except:
-                    labels = []
-            elif not isinstance(labels, list):
-                labels = []
-            explanations = pr_result['explanations']
-            if isinstance(explanations, str):
-                try:
-                    explanations = json.loads(explanations)
-                except:
-                    explanations = []
-            elif not isinstance(explanations, list):
-                explanations = []
+    unlabeled_rows = []
 
-            response = {
-                'model': model_name,
-                'risk_type_labels': labels,
-                'explanations': explanations
+    for pr_number in tqdm(sorted(all_pr_numbers), desc='Consensus'):
+        per_model_rows = {}
+        for model_name, df in model_results.items():
+            per_model_rows[model_name] = _collect_model_row(df, pr_number)
+
+        if any(row.empty for row in per_model_rows.values()):
+            unlabeled_rows.append({
+                'pr_number': pr_number,
+                'reason': 'Missing model output for at least one model',
+                'model_outputs': json.dumps({
+                    m: {'present': not per_model_rows[m].empty}
+                    for m in model_names
+                })
+            })
+            continue
+
+        # Use first model as anchor for exact per-label agreement.
+        anchor_model = model_names[0]
+        anchor_row = per_model_rows[anchor_model]
+
+        agreed = True
+        disagreement_labels = []
+        for col in DECISION_COLUMNS:
+            anchor_decision = _norm_decision(anchor_row.get(col, 'No'))
+            for model_name in model_names[1:]:
+                other_decision = _norm_decision(per_model_rows[model_name].get(col, 'No'))
+                if anchor_decision != other_decision:
+                    agreed = False
+                    disagreement_labels.append(col)
+                    break
+
+        model_summary = {}
+        for model_name, row in per_model_rows.items():
+            model_summary[model_name] = {
+                col: _norm_decision(row.get(col, 'No'))
+                for col in DECISION_COLUMNS
             }
 
-            if not pr_result['success']:
-                response['error'] = pr_result['error']
+        if agreed and len(model_names) >= consensus_threshold:
+            accepted_row = {
+                'pr_number': pr_number,
+                'consensus_models': ','.join(model_names),
+                'consensus_layer': int(anchor_row.get('layer', 0))
+            }
+            for col in DECISION_COLUMNS:
+                accepted_row[col] = _norm_decision(anchor_row.get(col, 'No'))
 
-            responses.append(response)
-        agree, agreed_labels, winning_responses = responses_agree(
-            responses, 
-            consensus_threshold
-        )
-        out_row = {
-            'pr_number': pr_number,
-            'accepted': agree,
-            'vote_count': len(winning_responses) if agree else 0,
-            'agreed_labels': ';'.join(agreed_labels) if agreed_labels else '',
-            'model_responses_summary': json.dumps([
-                {
-                    'model': r['model'],
-                    'labels': r.get('risk_type_labels', []),
-                    'error': r.get('error', '')
+                reasons = {
+                    model_name: str(per_model_rows[model_name].get(f'{col}_reason', ''))
+                    for model_name in model_names
                 }
-                for r in responses
-            ])
-        }
-        if agree and agreed_labels and winning_responses:
-            first_winner = winning_responses[0]
-            explanations_list = first_winner.get('explanations', [])
-            explanations_dict = {}
-            for exp in explanations_list:
-                lbl = exp.get('label', '')
-                if lbl in agreed_labels:
-                    explanations_dict[lbl] = {
-                        'confidence': exp.get('confidence', 0.0),
-                        'rationale': exp.get('rationale', '')
-                    }
-            out_row['explanations'] = json.dumps(explanations_dict)
-        else:
-            out_row['explanations'] = '{}'
-        if agree:
-            accepted_rows.append(out_row)
-        else:
-            human_rows.append(out_row)
-    accepted_df = pd.DataFrame(accepted_rows)
-    human_df = pd.DataFrame(human_rows)
-    total = len(accepted_df) + len(human_df)
-    print(f'✅ Consensus complete:')
-    if total > 0:
-        print(f'   Accepted: {len(accepted_df)} ({len(accepted_df)/total*100:.1f}%)')
-        print(f'   Need human review: {len(human_df)} ({len(human_df)/total*100:.1f}%)')
-    else:
-        print('   No PRs processed during merging')
+                accepted_row[f'{col}_reason'] = json.dumps(reasons)
 
-    return accepted_df, human_df
+            accepted_row['model_outputs'] = json.dumps(model_summary)
+            accepted_rows.append(accepted_row)
+        else:
+            unlabeled_rows.append({
+                'pr_number': pr_number,
+                'reason': f'Disagreement on labels: {sorted(set(disagreement_labels))}',
+                'model_outputs': json.dumps(model_summary)
+            })
+
+    accepted_df = pd.DataFrame(accepted_rows)
+    unlabeled_df = pd.DataFrame(unlabeled_rows)
+
+    total = len(accepted_df) + len(unlabeled_df)
+    print(f'Consensus complete. Accepted={len(accepted_df)}, Unlabeled={len(unlabeled_df)}, Total={total}')
+    return accepted_df, unlabeled_df

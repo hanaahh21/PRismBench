@@ -51,3 +51,4 @@ def lookup_pr_details(pr_number: int, ml_features_df: pd.DataFrame) -> Dict:
 def save_df(df: pd.DataFrame, path: str):
     df.to_csv(path, index=False)
     print('Saved %s (%d rows)' % (path, len(df)))
+

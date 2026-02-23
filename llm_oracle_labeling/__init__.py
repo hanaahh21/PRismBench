@@ -1,10 +1,12 @@
-from .pipeline import run_labeling_pipeline
+from .pipeline import initialize_pipeline, run_layer
 from .analysis import analyze_labeling_quality
-from .config import RISK_TYPE_LABELS, CONSENSUS_THRESHOLD
+from .config import RISK_TYPE_LABELS, CONSENSUS_THRESHOLD, UNARY_LABELS
 
 __all__ = [
-    'run_labeling_pipeline',
+    'initialize_pipeline',
+    'run_layer',
     'analyze_labeling_quality',
     'RISK_TYPE_LABELS',
+    'UNARY_LABELS',
     'CONSENSUS_THRESHOLD',
 ]
