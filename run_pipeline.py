@@ -4,6 +4,7 @@ import os
 import pandas as pd
 from uncertainty_with_dnn.run_unceratinty_selection import run_uncertainty_selection
 from llm_oracle_labeling import initialize_pipeline, run_layer, analyze_labeling_quality
+from llm_oracle_labeling.config import GLOBAL_ACCEPTED_FILE, GLOBAL_UNLABELED_FILE, LAYERS_BASE_DIR
 from extract_and_assign_labels import extract_and_assign_labels
 
 
@@ -25,9 +26,8 @@ def show_menu():
 def show_status():
     """Show current accepted/unlabeled counts."""
     
-    layers_dir = 'Layers'
-    accepted_file = os.path.join(layers_dir, 'accepted.csv')
-    unlabeled_file = os.path.join(layers_dir, 'unlabeled.csv')
+    accepted_file = os.path.join(LAYERS_BASE_DIR, GLOBAL_ACCEPTED_FILE)
+    unlabeled_file = os.path.join(LAYERS_BASE_DIR, GLOBAL_UNLABELED_FILE)
     
     if os.path.exists(accepted_file):
         accepted_df = pd.read_csv(accepted_file)
@@ -67,7 +67,7 @@ def main():
         output_dir=Path("UncertainPoint"),
         model_monitor_dir=Path("ModelMonitoring"),
         n_top_uncertain=100,
-        k_diverse=25,
+        k_diverse=100,
         metric="euclidean",
         verbose=True
     )
@@ -96,9 +96,8 @@ def main():
         elif user_input == 'a':
             print("\nAnalyzing labeling quality...")
             
-            layers_dir = 'Layers'
-            accepted_file = os.path.join(layers_dir, 'accepted.csv')
-            unlabeled_file = os.path.join(layers_dir, 'unlabeled.csv')
+            accepted_file = os.path.join(LAYERS_BASE_DIR, GLOBAL_ACCEPTED_FILE)
+            unlabeled_file = os.path.join(LAYERS_BASE_DIR, GLOBAL_UNLABELED_FILE)
             
             if os.path.exists(accepted_file) and os.path.exists(unlabeled_file):
                 accepted_df = pd.read_csv(accepted_file)
@@ -138,7 +137,7 @@ def main():
                 # Validate that previous layer exists before running convergence layers
                 if layer_num > 0:
                     import os
-                    prev_layer_dir = os.path.join('Layers', str(layer_num - 1))
+                    prev_layer_dir = os.path.join(LAYERS_BASE_DIR, str(layer_num - 1))
                     if not os.path.exists(prev_layer_dir):
                         print(f"❌ Cannot run Layer {layer_num}: Previous Layer {layer_num - 1} not found.")
                         print(f"   Please run Layer {layer_num - 1} first.")

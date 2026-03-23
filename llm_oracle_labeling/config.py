@@ -54,7 +54,7 @@ MODELS_CONFIG = [
 ]
 
 # Directory / file configuration
-LAYERS_BASE_DIR = 'layers'
+LAYERS_BASE_DIR = 'Layers'
 LAYER_CSV_SUBDIR = 'csv_files'
 PER_LAYER_MODEL_FILE_PATTERN = 'Layer{layer}_{model_name}.csv'
 LAYER_ACCEPTED_FILE_PATTERN = 'Layer{layer}_accepted.csv'

@@ -1,100 +1,101 @@
-import pandas as pd
 from pathlib import Path
-from llm_oracle_labeling.config import (
-    RISK_TYPE_LABELS
-)
 
-def extract_and_assign_labels(loop_number):
+import pandas as pd
+
+from llm_oracle_labeling.config import GLOBAL_ACCEPTED_FILE, LAYERS_BASE_DIR
+
+
+ACCEPTED_TO_TRAINING_LABEL_MAP = {
+    "bug": "bug",
+    "security": "security",
+    "performance": "performance",
+    "maintainability": "code_quality_or_maintenability",
+}
+
+
+def _require_columns(df: pd.DataFrame, required_columns: list[str], source_name: str) -> None:
+    missing_columns = [column for column in required_columns if column not in df.columns]
+    if missing_columns:
+        raise ValueError(f"{source_name} is missing required columns: {missing_columns}")
+
+
+def extract_and_assign_labels(loop_number: int) -> None:
     """
-    Extract labels from accepted_labels.csv and assign them to unlabeled_data.csv.
-    Save labeled PRs to the next loop folder as labeled_train_data.csv
-    
-    Labeling convention:
-    - bug, security, performance, code_quality_or_maintenability: 0 or 1
-    - non_risky: 1 if all risky categories are 0, else 0
+    Convert accepted consensus labels into training rows for the next loop.
+
+    Workflow:
+    1. Read accepted PR-level consensus labels from Layers/accepted.csv
+    2. Read the previous loop's unlabeled feature rows
+    3. Join by pr_number to recover the full ML feature rows
+    4. Convert Yes/No label decisions into 1/0 training targets
+    5. Save as SamplingLoopData/loop_{loop_number}_data/labeled_train_data.csv
     """
 
-    # Define paths
-    sampling_dir=Path("SamplingLoopData")
-    
-    # accepted labels location
-    accepted_labels_dir=Path("AcceptedLabels")
-    accepted_labels_path = accepted_labels_dir / f"accepted_labels_{loop_number}.csv"
-    
-    # unlabled data location
-    unlabeled_dir =sampling_dir / f"loop_{loop_number - 1}_data"
-    unlabeled_path = unlabeled_dir / "unlabeled_data.csv"
+    sampling_dir = Path("SamplingLoopData")
+    accepted_labels_path = Path(LAYERS_BASE_DIR) / GLOBAL_ACCEPTED_FILE
+    previous_loop_dir = sampling_dir / f"loop_{loop_number - 1}_data"
+    previous_unlabeled_path = previous_loop_dir / "unlabeled_data.csv"
+    next_loop_dir = sampling_dir / f"loop_{loop_number}_data"
+    next_loop_dir.mkdir(parents=True, exist_ok=True)
+    label_save_path = next_loop_dir / "labeled_train_data.csv"
 
-    # folder to save labeled prs
-    label_save_dir = sampling_dir / f"loop_{loop_number}_data"
-    label_save_dir.mkdir(parents=True, exist_ok=True)
-    label_save_path = label_save_dir / "labeled_train_data.csv"
+    if not accepted_labels_path.exists():
+        raise FileNotFoundError(
+            f"Accepted consensus file not found: {accepted_labels_path}. "
+            "Run the LLM convergence layers first."
+        )
 
-    # read accepted label data
-    if accepted_labels_path.exists():
-        accepted_label_df = pd.read_csv(accepted_labels_path)
-        print(f"Total accepted label records: {len(accepted_label_df)}")
-    else:
-        print(f"WARNING: {accepted_labels_path} not found")
-        accepted_label_df = pd.DataFrame()
+    if not previous_unlabeled_path.exists():
+        raise FileNotFoundError(
+            f"Previous loop unlabeled data not found: {previous_unlabeled_path}"
+        )
 
-    # take the necessary columns
-    accepted_label_df = accepted_label_df[["pr_number", "agreed_labels"]]
+    accepted_df = pd.read_csv(accepted_labels_path)
+    unlabeled_df = pd.read_csv(previous_unlabeled_path)
 
-    # read unlabled data
-    if unlabeled_path.exists():
-        unlabeled_df = pd.read_csv(unlabeled_path)
-        print(f"Total accepted label records: {len(unlabeled_df)}")
-    else:
-        print(f"WARNING: {unlabeled_path} not found")
-        unlabeled_df = pd.DataFrame()
-     
-    # extract only the prs to be assigned a label
-    label_process_cand_pr = unlabeled_df.merge(
-        accepted_label_df[["pr_number"]],
-        on="pr_number",
-        how="inner"
+    _require_columns(
+        accepted_df,
+        ["pr_number", *ACCEPTED_TO_TRAINING_LABEL_MAP.keys()],
+        str(accepted_labels_path),
     )
-    print(len(label_process_cand_pr), len(accepted_label_df))
-    # assert check for length
-    assert(len(label_process_cand_pr)==len(accepted_label_df))
+    _require_columns(unlabeled_df, ["pr_number"], str(previous_unlabeled_path))
 
-    # initialize label columns in the label_process_cand_pr 
-    label_process_cand_pr["bug"]=0
-    label_process_cand_pr["security"]=0
-    label_process_cand_pr["performance"]=0
-    label_process_cand_pr["code_quality_or_maintenability"]=0
-    # label_process_cand_pr["non_risky"]=0
+    accepted_labels_df = accepted_df[["pr_number", *ACCEPTED_TO_TRAINING_LABEL_MAP.keys()]].copy()
 
-    for _, row in accepted_label_df.iterrows():
-        # get the pr number 
-        pr_number = row["pr_number"]
+    labeled_train_df = unlabeled_df.merge(
+        accepted_labels_df,
+        on="pr_number",
+        how="inner",
+    )
 
-        # get labels
-        agreed_labels = row["agreed_labels"].split(";")
+    if len(labeled_train_df) != len(accepted_labels_df):
+        raise ValueError(
+            "Mismatch between accepted PRs and recovered feature rows. "
+            f"Recovered {len(labeled_train_df)} rows for {len(accepted_labels_df)} accepted PRs."
+        )
 
-        for label in agreed_labels:
-            # bug risk case
-            if label == RISK_TYPE_LABELS[0]:
-                label_process_cand_pr.loc[label_process_cand_pr["pr_number"]==pr_number, "bug"] = 1
-            # security risk case
-            if label == RISK_TYPE_LABELS[1]:
-                label_process_cand_pr.loc[label_process_cand_pr["pr_number"]==pr_number, "security"] = 1
-            # performace risk case
-            if label == RISK_TYPE_LABELS[2]:
-                label_process_cand_pr.loc[label_process_cand_pr["pr_number"]==pr_number, "performance"] = 1
-            # maintainability risk case
-            if label == RISK_TYPE_LABELS[3]:
-                label_process_cand_pr.loc[label_process_cand_pr["pr_number"]==pr_number, "code_quality_or_maintenability"] = 1
-            # non-risky case
-            # if label == RISK_TYPE_LABELS[4]:
-            #     label_process_cand_pr.loc[label_process_cand_pr["pr_number"]==pr_number, "non_risky"] = 1
+    for accepted_column, training_column in ACCEPTED_TO_TRAINING_LABEL_MAP.items():
+        labeled_train_df[training_column] = (
+            labeled_train_df[accepted_column]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .map({"yes": 1, "no": 0})
+        )
 
-    label_process_cand_pr.to_csv(label_save_path, index=False)
-    print(f"Wrote .csv to: {len(unlabeled_df)}")
-         
+        if labeled_train_df[training_column].isna().any():
+            invalid_values = sorted(labeled_train_df[accepted_column].dropna().astype(str).unique().tolist())
+            raise ValueError(
+                f"Unexpected label values found in column '{accepted_column}': {invalid_values}"
+            )
+
+    labeled_train_df = labeled_train_df.drop(columns=list(ACCEPTED_TO_TRAINING_LABEL_MAP.keys()))
+    labeled_train_df.to_csv(label_save_path, index=False)
+
+    print(f"Accepted consensus records: {len(accepted_df)}")
+    print(f"Recovered labeled training rows: {len(labeled_train_df)}")
+    print(f"Wrote labeled training data to: {label_save_path}")
+
 
 if __name__ == "__main__":
-    # Extract and assign labels to unlabeled data from accepted_labels
     extract_and_assign_labels(1)
-        
