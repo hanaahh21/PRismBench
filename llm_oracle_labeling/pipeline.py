@@ -20,9 +20,9 @@ from .merger import merge_model_results_and_apply_consensus
 from .model_processor import process_all_prs_with_model_unary
 
 MODELS_CONFIG = [
-    {'name': 'Gemma', 'query_fn': query_gemma},
-    {'name': 'Llama', 'query_fn': query_llama},
-    {'name': 'Mistral', 'query_fn': query_mistral},
+    {'name': 'Qwen3', 'query_fn': query_gemma},
+    {'name': 'Gemma2', 'query_fn': query_llama},
+    {'name': 'Llama3.1', 'query_fn': query_mistral},
 ]
 
 # Global state for pipeline execution

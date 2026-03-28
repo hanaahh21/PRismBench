@@ -48,9 +48,9 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 
 # Model configuration
 MODELS_CONFIG = [
-    {'name': 'Gemma', 'model_id': 'gemma2:9b', 'query_fn': 'query_gemma'},
-    {'name': 'Llama', 'model_id': 'llama3.1:8b', 'query_fn': 'query_llama'},
-    {'name': 'Mistral', 'model_id': 'mistral:7b-instruct', 'query_fn': 'query_mistral'}
+    {'name': 'Qwen3', 'model_id': 'qwen3:14b', 'query_fn': 'query_gemma'},
+    {'name': 'Gemma2', 'model_id': 'gemma2:9b', 'query_fn': 'query_llama'},
+    {'name': 'Llama3.1', 'model_id': 'llama3.1:8b', 'query_fn': 'query_mistral'}
 ]
 
 # Directory / file configuration
