@@ -14,10 +14,24 @@ from torchmetrics.classification import (
     MultilabelRecall,
 )
 
-from Model.tabular_dataset import TabularDataset
+from Model.graph_dataset import TabularDataset, collate_graph_batch
 
 from sklearn.utils.class_weight import compute_class_weight
 from typing import Tuple
+
+
+def _move_graph_batch_to_device(graph_batch: dict) -> dict:
+    node_x = {k: v.to(DEVICE) for k, v in graph_batch["node_x"].items()}
+    edge_index = {k: v.to(DEVICE) for k, v in graph_batch["edge_index"].items()}
+    node_batch = {k: v.to(DEVICE) for k, v in graph_batch["node_batch"].items()}
+    return {
+        "node_x": node_x,
+        "edge_index": edge_index,
+        "node_batch": node_batch,
+        "num_graphs": graph_batch["num_graphs"],
+        "pr_number": graph_batch["pr_number"].to(DEVICE),
+    }
+
 
 def set_seed(seed: int) -> None:
     """
@@ -29,10 +43,22 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def make_data_loaders(X: pd.DataFrame, y: pd.DataFrame, batch_size: int) -> Tuple[DataLoader, int]:
+def make_data_loaders(
+    X: pd.DataFrame,
+    y: pd.DataFrame,
+    batch_size: int,
+    shuffle: bool = True,
+) -> Tuple[DataLoader, int]:
 
     dataset = TabularDataset(X, y)
-    dataloader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=True,  drop_last=False)
+    graph_mode = getattr(dataset, "graph_mode", False)
+    dataloader = DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=False,
+        collate_fn=collate_graph_batch if graph_mode else None,
+    )
 
     return dataloader, len(dataset)
 
@@ -49,8 +75,12 @@ def get_prediction_probs(model: torch.nn.Module, loader: DataLoader) -> Tuple[np
     # process data in batches: xb, yb
     for xb, yb in loader:
 
-        xb = xb.to(DEVICE)
-        yb=yb.to(DEVICE)
+        if isinstance(xb, dict):
+            xb = _move_graph_batch_to_device(xb)
+        else:
+            xb = xb.to(DEVICE)
+
+        yb = yb.to(DEVICE)
 
         # raw output from model
         logits = model(xb)
@@ -58,9 +88,8 @@ def get_prediction_probs(model: torch.nn.Module, loader: DataLoader) -> Tuple[np
         # sigmoid to convert logits to prob
         prob = torch.sigmoid(logits).cpu().numpy()
 
-       
         probalities.append(prob)
-        y_source.append(yb.cpu().numpy()) 
+        y_source.append(yb.cpu().numpy())
 
     return np.concatenate(probalities, axis=0), np.concatenate(y_source, axis=0)
 
@@ -82,11 +111,11 @@ def calc_pos_class_weight(y: pd.DataFrame) -> torch.Tensor:
         if len(unique_classes)==1:
             pos_weight=1
         else:
-            class_weights = compute_class_weight( 
+            class_weights = compute_class_weight(
                 class_weight="balanced",
                 classes=unique_classes,
                 y=y_i
-            ) 
+            )
             # class_weights --> [class_weight_for_class 0, class_weight_for_class 1]
             pos_weight = class_weights[1]
 
@@ -94,34 +123,34 @@ def calc_pos_class_weight(y: pd.DataFrame) -> torch.Tensor:
 
     return torch.tensor(pos_weights_list, dtype=torch.float32).to(DEVICE)
 
+
 def calculate_evaluation_metrics(probs: np.ndarray, y_true: np.ndarray, threshold: float) -> dict:
     """
     Calculate multilabel evaluation metrics: accuracy, F1 score, precision, and recall.
     """
-    
+
     # labels from prediction probability values
     preds = (probs > threshold).astype(int)
-    
+
     preds_tensor = torch.tensor(preds, dtype=torch.float32)
     y_true_tensor = torch.tensor(y_true, dtype=torch.float32)
-    
+
     num_labels = y_true.shape[1]
-    
+
 
     accuracy = MultilabelAccuracy(num_labels=num_labels)
     precision = MultilabelPrecision(num_labels=num_labels)
     recall = MultilabelRecall(num_labels=num_labels)
-    micro_f1 = MultilabelF1Score(num_labels=num_labels, average="micro")
-  
+    f1_metric = MultilabelF1Score(num_labels=num_labels, average="micro")
+
     acc_val = accuracy(preds_tensor, y_true_tensor)
     prec_val = precision(preds_tensor, y_true_tensor)
     rec_val = recall(preds_tensor, y_true_tensor)
-    micro_f1_val = micro_f1(preds_tensor, y_true_tensor)
-    
+    f1_val = f1_metric(preds_tensor, y_true_tensor)
+
     return {
         'accuracy': acc_val.item(),
         'precision': prec_val.item(),
         'recall': rec_val.item(),
-        'micro_f1': micro_f1_val.item(),
+        'f1': f1_val.item(),
     }
-

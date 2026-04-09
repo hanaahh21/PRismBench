@@ -15,6 +15,8 @@ env/
 # Model files
 *.pt
 
+graphs/
+
 # IDE
 .vscode/
 .idea/

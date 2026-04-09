@@ -5,13 +5,13 @@ import pandas as pd
 
 from .config import (
     BATCH_SIZE,
-    GLOBAL_ACCEPTED_FILE,
     GLOBAL_UNLABELED_FILE,
     LAYER_ACCEPTED_FILE_PATTERN,
     LAYER_CSV_SUBDIR,
     LAYER_UNLABELED_FILE_PATTERN,
     LAYERS_BASE_DIR,
     MAX_CONVERGENCE_LAYERS,
+    MODELS_CONFIG,
     TARGET_ACCEPTED_COUNT,
 )
 from .data_loader import get_pr_numbers_from_csv, load_ml_features_dataset, lookup_pr_details
@@ -19,17 +19,18 @@ from .llm_client import query_gemma, query_llama, query_mistral
 from .merger import merge_model_results_and_apply_consensus
 from .model_processor import process_all_prs_with_model_unary
 
-MODELS_CONFIG = [
-    {'name': 'Qwen3', 'query_fn': query_gemma},
-    {'name': 'Gemma2', 'query_fn': query_llama},
-    {'name': 'Llama3.1', 'query_fn': query_mistral},
-]
-
 # Global state for pipeline execution
 _PIPELINE_STATE = {
     'pr_numbers': None,
     'pr_details_map': None,
     'ml_features_df': None,
+    'layers_base_dir': LAYERS_BASE_DIR,
+}
+
+QUERY_FN_BY_NAME = {
+    'query_gemma': query_gemma,
+    'query_llama': query_llama,
+    'query_mistral': query_mistral,
 }
 
 
@@ -39,6 +40,10 @@ def _chunk_list(items: List[int], chunk_size: int) -> List[List[int]]:
 
 def _ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
+
+
+def _get_layers_base_dir() -> str:
+    return _PIPELINE_STATE.get('layers_base_dir') or LAYERS_BASE_DIR
 
 
 def _build_pr_details_map(pr_numbers: List[int], ml_features_df: pd.DataFrame) -> Dict[int, Dict]:
@@ -56,7 +61,8 @@ def _load_prior_layer_outputs(layer_number: int) -> Optional[Dict[str, pd.DataFr
     if layer_number == 0:
         return None
     
-    prior_layer_dir = os.path.join(LAYERS_BASE_DIR, str(layer_number - 1))
+    layers_base_dir = _get_layers_base_dir()
+    prior_layer_dir = os.path.join(layers_base_dir, str(layer_number - 1))
     prior_outputs = {}
     
     for model_cfg in MODELS_CONFIG:
@@ -73,12 +79,9 @@ def _load_prior_layer_outputs(layer_number: int) -> Optional[Dict[str, pd.DataFr
 
 
 def _save_global_state(base_dir: str, accepted_df: pd.DataFrame, unlabeled_df: pd.DataFrame):
-    """Save global accepted and unlabeled CSVs (overwrites previous)."""
-    accepted_path = os.path.join(base_dir, GLOBAL_ACCEPTED_FILE)
+    """Save global unlabeled CSV (overwrites previous)."""
     unlabeled_path = os.path.join(base_dir, GLOBAL_UNLABELED_FILE)
-    accepted_df.to_csv(accepted_path, index=False)
     unlabeled_df.to_csv(unlabeled_path, index=False)
-    print(f'\n✅ Updated global accepted: {accepted_path} ({len(accepted_df)})')
     print(f'✅ Updated global unlabeled: {unlabeled_path} ({len(unlabeled_df)})\n')
 
 
@@ -90,7 +93,8 @@ def _run_single_batch(
     prior_layer_outputs: Optional[Dict[str, pd.DataFrame]] = None
 ) -> Tuple[Dict[str, pd.DataFrame], str]:
     """Run a single batch of PRs through all 3 models."""
-    batch_dir = os.path.join(LAYERS_BASE_DIR, str(layer_number), f'Batch{batch_number}', LAYER_CSV_SUBDIR)
+    layers_base_dir = _get_layers_base_dir()
+    batch_dir = os.path.join(layers_base_dir, str(layer_number), f'Batch{batch_number}', LAYER_CSV_SUBDIR)
     _ensure_dir(batch_dir)
 
     model_outputs: Dict[str, pd.DataFrame] = {}
@@ -102,7 +106,8 @@ def _run_single_batch(
 
     for model_cfg in MODELS_CONFIG:
         model_name = model_cfg['name']
-        query_fn = model_cfg['query_fn']
+        query_fn_ref = model_cfg['query_fn']
+        query_fn = QUERY_FN_BY_NAME[query_fn_ref] if isinstance(query_fn_ref, str) else query_fn_ref
 
         print(f'Layer {layer_number} | Batch {batch_number} | {model_name}')
         batch_df = process_all_prs_with_model_unary(
@@ -126,8 +131,8 @@ def _run_single_batch(
 def _run_layer_0_with_batches(
     pr_numbers: List[int],
     pr_details_map: Dict[int, Dict],
-    num_batches: int = 4,
-    batch_size: int = 25
+    num_batches: int = 1,
+    batch_size: Optional[int] = None
 ) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame]:
     """
     Run Layer 0 explicitly in 4 batches.
@@ -135,11 +140,14 @@ def _run_layer_0_with_batches(
     Final merged results are saved to Layers/Layer0/
     """
     print('\n' + '='*80)
-    print('LAYER 0: INITIAL EVALUATION (4 Batches of 25 PRs)')
+    print('LAYER 0: INITIAL EVALUATION (FULL DATASET, NO BATCH SPLIT)')
     print('='*80)
 
-    # Split into 4 explicit batches
-    batches = _chunk_list(pr_numbers[:num_batches * batch_size], batch_size)
+    # Process full layer in one batch unless a batch size is explicitly provided.
+    if batch_size is None:
+        batches = [pr_numbers]
+    else:
+        batches = _chunk_list(pr_numbers[:num_batches * batch_size], batch_size)
     all_model_dataframes: Dict[str, List[pd.DataFrame]] = {cfg['name']: [] for cfg in MODELS_CONFIG}
     
     for batch_idx, batch_pr_numbers in enumerate(batches):
@@ -156,7 +164,8 @@ def _run_layer_0_with_batches(
 
     # Merge all batch results per model
     merged_model_outputs = {}
-    layer0_dir = os.path.join(LAYERS_BASE_DIR, '0')
+    layers_base_dir = _get_layers_base_dir()
+    layer0_dir = os.path.join(layers_base_dir, '0')
     _ensure_dir(layer0_dir)
     
     for model_name in all_model_dataframes.keys():
@@ -171,7 +180,11 @@ def _run_layer_0_with_batches(
     accepted_df, unlabeled_df = merge_model_results_and_apply_consensus(merged_model_outputs, consensus_threshold=3)
 
     # Save global accepted and unlabeled
-    _save_global_state(LAYERS_BASE_DIR, accepted_df, unlabeled_df)
+    layer0_accepted_path = os.path.join(layer0_dir, 'Layer_0_accepted.csv')
+    accepted_df.to_csv(layer0_accepted_path, index=False)
+    print(f'✓ Saved layer accepted results: {layer0_accepted_path}')
+
+    _save_global_state(layers_base_dir, accepted_df, unlabeled_df)
 
     print(f'\n{"="*80}')
     print(f'Layer 0 Complete: {len(accepted_df)} accepted, {len(unlabeled_df)} unlabeled')
@@ -184,7 +197,7 @@ def _run_convergence_layer(
     layer_number: int,
     pr_numbers: List[int],
     pr_details_map: Dict[int, Dict],
-    batch_size: int = 25
+    batch_size: Optional[int] = None
 ) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame, pd.DataFrame]:
     """
     Run a convergence layer (Layer 1+).
@@ -198,7 +211,11 @@ def _run_convergence_layer(
     # Load prior layer outputs for context
     prior_layer_outputs = _load_prior_layer_outputs(layer_number)
     
-    batches = _chunk_list(pr_numbers, batch_size)
+    # Process full convergence layer in one batch unless a batch size is explicitly provided.
+    if batch_size is None:
+        batches = [pr_numbers]
+    else:
+        batches = _chunk_list(pr_numbers, batch_size)
     all_model_dataframes: Dict[str, List[pd.DataFrame]] = {cfg['name']: [] for cfg in MODELS_CONFIG}
     
     for batch_idx, batch_pr_numbers in enumerate(batches):
@@ -215,7 +232,8 @@ def _run_convergence_layer(
 
     # Merge all batch results per model
     merged_model_outputs = {}
-    layer_dir = os.path.join(LAYERS_BASE_DIR, str(layer_number))
+    layers_base_dir = _get_layers_base_dir()
+    layer_dir = os.path.join(layers_base_dir, str(layer_number))
     _ensure_dir(layer_dir)
     
     for model_name in all_model_dataframes.keys():
@@ -230,7 +248,11 @@ def _run_convergence_layer(
     layer_accepted_df, layer_unlabeled_df = merge_model_results_and_apply_consensus(merged_model_outputs, consensus_threshold=3)
 
     # Update global state
-    _save_global_state(LAYERS_BASE_DIR, layer_accepted_df, layer_unlabeled_df)
+    layer_accepted_path = os.path.join(layer_dir, f'Layer_{layer_number}_accepted.csv')
+    layer_accepted_df.to_csv(layer_accepted_path, index=False)
+    print(f'✓ Saved layer accepted results: {layer_accepted_path}')
+
+    _save_global_state(layers_base_dir, layer_accepted_df, layer_unlabeled_df)
 
     print(f'\n{"="*80}')
     print(f'Layer {layer_number} Complete: {len(layer_accepted_df)} accepted, {len(layer_unlabeled_df)} unlabeled')
@@ -243,6 +265,7 @@ def initialize_pipeline(
     ml_features_csv: str,
     pr_list_csv: str,
     max_items: int = None,
+    layers_base_dir: str = None,
 ) -> None:
     """Initialize pipeline with data. Call this once before running layers."""
     global _PIPELINE_STATE
@@ -263,6 +286,7 @@ def initialize_pipeline(
     _PIPELINE_STATE['pr_numbers'] = valid_pr_numbers
     _PIPELINE_STATE['pr_details_map'] = pr_details_map
     _PIPELINE_STATE['ml_features_df'] = ml_features_df
+    _PIPELINE_STATE['layers_base_dir'] = layers_base_dir or LAYERS_BASE_DIR
     
     print(f'✓ Pipeline initialized with {len(valid_pr_numbers)} PRs')
     print(f'{"="*80}\n')
@@ -286,16 +310,17 @@ def run_layer(layer_number: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
     pr_details_map = _PIPELINE_STATE['pr_details_map']
     
     if layer_number == 0:
-        # Layer 0: Process all PRs in 4 explicit batches
+        # Layer 0: Process all PRs in one full batch
         _, accepted_df, unlabeled_df = _run_layer_0_with_batches(
             pr_numbers=_PIPELINE_STATE['pr_numbers'],
             pr_details_map=pr_details_map,
-            num_batches=4,
-            batch_size=25
+            num_batches=1,
+            batch_size=None
         )
     else:
         # Convergence layers: Load unlabeled PRs and re-evaluate
-        unlabeled_path = os.path.join(LAYERS_BASE_DIR, GLOBAL_UNLABELED_FILE)
+        layers_base_dir = _get_layers_base_dir()
+        unlabeled_path = os.path.join(layers_base_dir, GLOBAL_UNLABELED_FILE)
         if not os.path.exists(unlabeled_path):
             raise FileNotFoundError(f'Unlabeled PRs file not found at {unlabeled_path}. Run Layer 0 first.')
         
@@ -310,7 +335,7 @@ def run_layer(layer_number: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
             layer_number=layer_number,
             pr_numbers=unlabeled_pr_numbers,
             pr_details_map=pr_details_map,
-            batch_size=25
+            batch_size=None
         )
     
     return accepted_df, unlabeled_df

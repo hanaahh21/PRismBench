@@ -35,7 +35,7 @@ CONSENSUS_THRESHOLD = 3  # strict all-3 agreement
 
 # Timeout settings
 LLM_TIMEOUT = 30
-OLLAMA_TIMEOUT = 180
+OLLAMA_TIMEOUT = 900
 
 # Prompt size limits
 MAX_PROMPT_CHARS = 80000
@@ -48,9 +48,9 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 
 # Model configuration
 MODELS_CONFIG = [
-    {'name': 'Qwen3', 'model_id': 'qwen3:14b', 'query_fn': 'query_gemma'},
-    {'name': 'Gemma2', 'model_id': 'gemma2:9b', 'query_fn': 'query_llama'},
-    {'name': 'Llama3.1', 'model_id': 'llama3.1:8b', 'query_fn': 'query_mistral'}
+    {'name': 'Mistral7BInstruct', 'model_id': 'mistral:7b-instruct', 'query_fn': 'query_mistral'},
+    {'name': 'Llama3.1_8B', 'model_id': 'llama3.1:8b', 'query_fn': 'query_llama'},
+    {'name': 'Gemma2', 'model_id': 'gemma2:9b', 'query_fn': 'query_gemma'}
 ]
 
 # Directory / file configuration

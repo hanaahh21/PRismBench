@@ -1,1 +1,1 @@
-# Uncertainty selection with DNN package
+# Uncertainty selection with GNN package
