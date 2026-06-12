@@ -19,10 +19,18 @@ from .prepare_data import (
 )
 from .uncertainty_metric_calc import calculate_prediction_entropy
 from .k_center_greedy import k_center_greedy_from_uncertain
-from Model.model_train import train_final_GNN, train_gnn_with_cv, calculate_evaluation_metrics
+from Model.model_train import (
+    train_final_GNN,
+    train_gnn_with_cv,
+    calculate_evaluation_metrics,
+    retrain_final_GNN_from_checkpoint,
+    train_gnn_with_cv_warm_start,
+)
 from Model.data_config import LABEL_COLS
 from Model.model_config import BATCH_SIZE, GNN_AUTO_LABEL_F1_THRESHOLD, LABEL_THRESHOLD
 from Model.model_utils import get_prediction_probs, make_data_loaders
+
+WARM_START_MAX_EPOCHS = 20
 
 
 def run_uncertainty_selection(
@@ -127,6 +135,68 @@ def run_uncertainty_selection(
         header=not os.path.exists(eval_metric_csv),
         index=False,
     )
+
+########################## Optional warm-start retraining evaluation (separate metrics file) #########################
+
+    previous_model_path = model_monitor_dir / "model_store" / f"final_model_{loop_number - 1}.pt"
+    if previous_model_path.exists():
+        _, warm_cv_average_f1, warm_best_hparams, _ = train_gnn_with_cv_warm_start(
+            X=X,
+            y=y,
+            optimizer_choice="adam",
+            checkpoint_state_dict=torch.load(previous_model_path, map_location="cpu"),
+            hidden_dims=best_hparams["hidden_dims"],
+            dropout=best_hparams["dropout"],
+        )
+
+        warm_start_model, _ = retrain_final_GNN_from_checkpoint(
+            X=X,
+            y=y,
+            hidden_dims=warm_best_hparams["hidden_dims"],
+            dropout=warm_best_hparams["dropout"],
+            lr=warm_best_hparams["lr"],
+            weight_decay=warm_best_hparams["weight_decay"],
+            batch_size=BATCH_SIZE,
+            optimizer_choice="adam",
+            checkpoint_state_dict=torch.load(previous_model_path, map_location="cpu"),
+            max_epochs=WARM_START_MAX_EPOCHS,
+        )
+
+        retrained_model_store_path = model_monitor_dir / "model_store" / f"retrained_model_{loop_number}.pt"
+        retrained_model_store_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(warm_start_model.state_dict(), retrained_model_store_path)
+
+        warm_test_prob, warm_test_label = get_prediction_probs(warm_start_model, test_loader)
+        warm_test_eval_metric = calculate_evaluation_metrics(warm_test_prob, warm_test_label, LABEL_THRESHOLD)
+
+        warm_eval_metric_csv = model_monitor_dir / "eval_metrics" / "final_model_evaluation_retrained.csv"
+        warm_eval_metric_csv.parent.mkdir(parents=True, exist_ok=True)
+        warm_eval_metric_row = {
+            "loop_number": loop_number,
+            "warm_cv_f1": warm_cv_average_f1,
+            "baseline_f1": test_eval_metric["f1"],
+            "retrained_f1": warm_test_eval_metric["f1"],
+            "accuracy": warm_test_eval_metric["accuracy"],
+            "precision": warm_test_eval_metric["precision"],
+            "recall": warm_test_eval_metric["recall"],
+            "f1": warm_test_eval_metric["f1"],
+        }
+        pd.DataFrame([warm_eval_metric_row]).to_csv(
+            warm_eval_metric_csv,
+            mode="a",
+            header=not os.path.exists(warm_eval_metric_csv),
+            index=False,
+        )
+        print(
+            f"[Loop {loop_number}] Warm-start retrain F1: {warm_test_eval_metric['f1']:.4f} "
+            f"(baseline {test_eval_metric['f1']:.4f}) | "
+            f"saved: {retrained_model_store_path}"
+        )
+    else:
+        print(
+            f"[Loop {loop_number}] Skipping warm-start retrain evaluation: "
+            f"no previous model found at {previous_model_path}"
+        )
 
 ########################## Switch to full GNN auto-labeling once model quality is high enough ########################
 

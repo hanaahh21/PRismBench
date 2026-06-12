@@ -83,6 +83,39 @@ def _build_gnn_model(in_dim_by_type, rel_types, hidden_dims, dropout, out_dim):
     ).to(DEVICE)
 
 
+def _load_checkpoint_compatible_state(
+    model: nn.Module,
+    checkpoint_state_dict: Dict[str, torch.Tensor],
+    context: str,
+) -> None:
+    """
+    Load only overlapping, shape-compatible parameters from checkpoint.
+    This avoids crashes when graph schema evolves between loops.
+    """
+    model_state = model.state_dict()
+    compatible = {}
+    skipped_mismatch = []
+
+    for key, tensor in checkpoint_state_dict.items():
+        if key not in model_state:
+            continue
+        if model_state[key].shape != tensor.shape:
+            skipped_mismatch.append(key)
+            continue
+        compatible[key] = tensor
+
+    missing_count = len(model_state) - len(compatible)
+    print(
+        f"[{context}] Warm-start checkpoint load: "
+        f"loaded={len(compatible)} params, missing_in_checkpoint_or_new={missing_count}, "
+        f"shape_mismatch_skipped={len(skipped_mismatch)}"
+    )
+    if skipped_mismatch:
+        print(f"[{context}] Example mismatched key: {skipped_mismatch[0]}")
+
+    model.load_state_dict(compatible, strict=False)
+
+
 def train_final_GNN(
     X: pd.DataFrame,
     y: pd.DataFrame,
@@ -161,6 +194,219 @@ def train_final_GNN(
             break
 
     return model, None
+
+
+def retrain_final_GNN_from_checkpoint(
+    X: pd.DataFrame,
+    y: pd.DataFrame,
+    hidden_dims: List[int],
+    dropout: float,
+    lr: float,
+    weight_decay: float,
+    batch_size: int,
+    optimizer_choice: str,
+    checkpoint_state_dict: Dict[str, torch.Tensor],
+    max_epochs: int = 20,
+):
+    """
+    Warm-start retraining variant:
+    - builds the same architecture from current best hparams
+    - loads previous-loop weights
+    - fine-tunes on the updated labeled set
+    """
+    print(
+        f"\nWarm-Start GNN Retraining with HParams: "
+        f"LR={lr}, WeightDecay={weight_decay}, Dropout={dropout}, HiddenDims={hidden_dims}, "
+        f"MaxEpochs={max_epochs}"
+    )
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=SEED, shuffle=True
+    )
+
+    in_dim_by_type, rel_types = _infer_graph_schema(X_train, y_train)
+    output_dim = y_train.shape[1]
+
+    model = _build_gnn_model(
+        in_dim_by_type=in_dim_by_type,
+        rel_types=rel_types,
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        out_dim=output_dim,
+    )
+    _load_checkpoint_compatible_state(model, checkpoint_state_dict, context="WarmRetrain")
+
+    optimizer = OPTIMIZERS[optimizer_choice](model.parameters(), lr=lr, weight_decay=weight_decay)
+    pos_weight = calc_pos_class_weight(y_train)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    train_loader, _ = make_data_loaders(X=X_train, y=y_train, batch_size=batch_size, shuffle=True)
+    val_loader, _ = make_data_loaders(X=X_val, y=y_val, batch_size=batch_size, shuffle=False)
+
+    n_no_improvement_loop = 0
+    best_f1_micro = -np.inf
+
+    epochs_to_run = max(1, int(max_epochs))
+    for epoch in range(epochs_to_run):
+        model.train()
+
+        for inputs, labels in train_loader:
+            inputs = _move_batch_to_device(inputs)
+            labels = labels.to(DEVICE)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+        validation_probs, validation_labels = get_prediction_probs(model, val_loader)
+        eval_metrics = calculate_evaluation_metrics(
+            probs=validation_probs,
+            y_true=validation_labels,
+            threshold=LABEL_THRESHOLD,
+        )
+
+        val_accuracy, val_precision, val_recall, val_micro_f1 = eval_metrics.values()
+        print(
+            f"[Warm] Epoch {epoch+1}/{epochs_to_run}, Val F1-micro: {val_micro_f1:.4f}  "
+            f"Val Recall: {val_recall:.4f}  Val Precision: {val_precision:.4f}  Val Acc: {val_accuracy:.4f}"
+        )
+
+        if val_micro_f1 > best_f1_micro + MIN_DELTA:
+            best_f1_micro = val_micro_f1
+            n_no_improvement_loop = 0
+        else:
+            n_no_improvement_loop += 1
+
+        if n_no_improvement_loop > EARLY_STOPPING_PATIENCE:
+            print(f"[Warm] Early Stopping at Epoch: {epoch + 1}")
+            break
+
+    return model, None
+
+
+def train_gnn_with_cv_warm_start(
+    X: pd.DataFrame,
+    y: pd.DataFrame,
+    optimizer_choice: str,
+    checkpoint_state_dict: Dict[str, torch.Tensor],
+    hidden_dims: List[int],
+    dropout: float,
+    k: int = 5,
+    batch_size: int = BATCH_SIZE,
+):
+    """
+    Warm-start CV with checkpoint initialization.
+    Architecture is fixed for checkpoint compatibility; CV searches lr and weight_decay.
+    """
+    kf = KFold(n_splits=k, shuffle=True, random_state=SEED)
+
+    fold_best_f1_scores = []
+    best_overall_f1 = -np.inf
+    best_hparams = None
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
+        print(f"\n{'='*50}")
+        print(f"Warm-Start Fold {fold+1}/{k}")
+        print(f"{'='*50}")
+
+        X_train = X.iloc[train_idx].reset_index(drop=True)
+        y_train = y.iloc[train_idx].reset_index(drop=True)
+        X_val = X.iloc[val_idx].reset_index(drop=True)
+        y_val = y.iloc[val_idx].reset_index(drop=True)
+
+        in_dim_by_type, rel_types = _infer_graph_schema(X_train, y_train)
+        output_dim = y_train.shape[1]
+
+        fold_best_f1 = -np.inf
+        for lr, weight_decay in itertools.product(PARAM_GRID["lr"], PARAM_GRID["weight_decay"]):
+            print(
+                f"\nWarm-Start CV train (k={fold+1}): "
+                f"LR={lr}, WeightDecay={weight_decay}, Dropout={dropout}, HiddenDims={hidden_dims}"
+            )
+
+            model = _build_gnn_model(
+                in_dim_by_type=in_dim_by_type,
+                rel_types=rel_types,
+                hidden_dims=hidden_dims,
+                dropout=dropout,
+                out_dim=output_dim,
+            )
+            _load_checkpoint_compatible_state(model, checkpoint_state_dict, context="WarmCV")
+
+            optimizer = OPTIMIZERS[optimizer_choice](model.parameters(), lr=lr, weight_decay=weight_decay)
+            pos_weight = calc_pos_class_weight(y_train)
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+            train_loader, _ = make_data_loaders(X=X_train, y=y_train, batch_size=batch_size, shuffle=True)
+            val_loader, _ = make_data_loaders(X=X_val, y=y_val, batch_size=batch_size, shuffle=False)
+
+            n_no_improvement_loop = 0
+            best_combo_f1 = -np.inf
+
+            for epoch in range(EPOCHS):
+                model.train()
+
+                for inputs, labels in train_loader:
+                    inputs = _move_batch_to_device(inputs)
+                    labels = labels.to(DEVICE)
+
+                    optimizer.zero_grad()
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                    loss.backward()
+                    optimizer.step()
+
+                validation_probs, validation_labels = get_prediction_probs(model, val_loader)
+                eval_metrics = calculate_evaluation_metrics(
+                    probs=validation_probs,
+                    y_true=validation_labels,
+                    threshold=LABEL_THRESHOLD,
+                )
+
+                val_accuracy, val_precision, val_recall, val_micro_f1 = eval_metrics.values()
+                print(
+                    f"[WarmCV] Epoch {epoch+1}/{EPOCHS}, Val F1-micro: {val_micro_f1:.4f}  "
+                    f"Val Recall: {val_recall:.4f}  Val Precision: {val_precision:.4f}  Val Acc: {val_accuracy:.4f}"
+                )
+
+                if val_micro_f1 > best_combo_f1 + MIN_DELTA:
+                    best_combo_f1 = val_micro_f1
+                    n_no_improvement_loop = 0
+                else:
+                    n_no_improvement_loop += 1
+
+                if n_no_improvement_loop > EARLY_STOPPING_PATIENCE:
+                    print(f"[WarmCV] Early Stopping at Epoch: {epoch + 1}")
+                    break
+
+            if best_combo_f1 > fold_best_f1:
+                fold_best_f1 = best_combo_f1
+
+            if best_combo_f1 > best_overall_f1:
+                best_overall_f1 = best_combo_f1
+                best_hparams = {
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                    "hidden_dims": hidden_dims,
+                    "dropout": dropout,
+                }
+
+        fold_best_f1_scores.append(fold_best_f1)
+
+    average_f1 = np.mean(fold_best_f1_scores)
+    std_f1 = np.std(fold_best_f1_scores)
+
+    print(f"\n{'='*50}")
+    print("Warm-Start Cross Validation Results:")
+    print(f"{'='*50}")
+    print(f"Average F1-micro: {average_f1:.4f} ± {std_f1:.4f}")
+    print(f"Best Fold F1-micro: {best_overall_f1:.4f}")
+    print(f"Best Hyperparameters: {best_hparams}")
+    print(f"Fold F1 scores: {fold_best_f1_scores}")
+
+    return None, average_f1, best_hparams, None
 
 
 def train_gnn_with_cv(X: pd.DataFrame, y: pd.DataFrame, optimizer_choice: str, k: int = 5, **kwargs):
@@ -253,6 +499,8 @@ def tune_hyper_param(
         train_loader, _ = make_data_loaders(X=X_train, y=y_train, batch_size=batch_size, shuffle=True)
         val_loader, _ = make_data_loaders(X=X_val, y=y_val, batch_size=batch_size, shuffle=False)
 
+        # Early-stopping must be tracked per hyperparameter trial.
+        combo_best_f1_micro = -np.inf
         n_no_improvement_loop = 0
 
         for epoch in range(EPOCHS):
@@ -281,6 +529,13 @@ def tune_hyper_param(
                 f"Val Recall: {val_recall:.4f}  Val Precision: {val_precision:.4f}  Val Acc: {val_accuracy:.4f}"
             )
 
+            if val_micro_f1 > combo_best_f1_micro + MIN_DELTA:
+                combo_best_f1_micro = val_micro_f1
+                n_no_improvement_loop = 0
+            else:
+                n_no_improvement_loop += 1
+
+            # Global best tracking remains across all trials.
             if val_micro_f1 > best_f1_micro + MIN_DELTA:
                 best_f1_micro = val_micro_f1
                 best_hparams = {
@@ -290,9 +545,6 @@ def tune_hyper_param(
                     "dropout": dropout,
                 }
                 best_model_state = copy.deepcopy(model.state_dict())
-                n_no_improvement_loop = 0
-            else:
-                n_no_improvement_loop += 1
 
             if n_no_improvement_loop > EARLY_STOPPING_PATIENCE:
                 print(f"Early Stopping at Epoch: {epoch + 1}")
